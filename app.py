@@ -124,8 +124,10 @@ def verify_chain():
         "chain_length": len(all_events)
     }), 200 if is_valid else 500
 
+with app.app_context():
+    db.create_all()
+
 if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+
