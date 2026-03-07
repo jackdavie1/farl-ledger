@@ -2,6 +2,7 @@ import os
 import hashlib
 import json
 from datetime import datetime, timezone
+
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
@@ -10,13 +11,25 @@ app = Flask(__name__)
 CORS(app)
 
 basedir = os.path.abspath(os.path.dirname(__file__))
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///' + os.path.join(basedir, 'ledger.db'))
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+database_url = os.getenv("DATABASE_URL")
+if database_url and database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = database_url or ("sqlite:///" + os.path.join(basedir, "ledger.db"))
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+print("FARL ledger booting...", flush=True)
+print(f"PORT={os.getenv('PORT', 'unset')}", flush=True)
+print(f"DATABASE_URL present={bool(os.getenv('DATABASE_URL'))}", flush=True)
+print(f"SQLALCHEMY_DATABASE_URI={app.config['SQLALCHEMY_DATABASE_URI']}", flush=True)
 
 db = SQLAlchemy(app)
 
+
 class Event(db.Model):
-    __tablename__ = 'events'
+    __tablename__ = "events"
+
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     timestamp = db.Column(db.String, nullable=False)
     entry_type = db.Column(db.String, nullable=False)
@@ -33,88 +46,102 @@ class Event(db.Model):
             "payload": json.loads(self.payload),
             "prev_hash": self.prev_hash,
             "entry_hash": self.entry_hash,
-            "created_at": self.created_at.isoformat()
+            "created_at": self.created_at.isoformat(),
         }
+
 
 def calculate_hash(timestamp, entry_type, payload, prev_hash):
     block_string = f"{timestamp}{entry_type}{payload}{prev_hash}".encode()
     return hashlib.sha256(block_string).hexdigest()
 
-@app.route('/health', methods=['GET'])
+
+@app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "healthy", "node": "FARL_LEDGER"}), 200
 
-@app.route('/log', methods=['POST'])
+
+@app.route("/log", methods=["POST"])
 def log_event():
-    data = request.get_json()
-    if not data or 'entry_type' not in data or 'payload' not in data:
+    data = request.get_json(silent=True)
+    if not data or "entry_type" not in data or "payload" not in data:
         return jsonify({"error": "Invalid payload"}), 400
 
     server_now = datetime.now(timezone.utc).isoformat()
     last_entry = Event.query.order_by(Event.id.desc()).first()
     prev_hash = last_entry.entry_hash if last_entry else "0" * 64
-    payload_str = json.dumps(data['payload'])
-    new_hash = calculate_hash(server_now, data['entry_type'], payload_str, prev_hash)
+    payload_str = json.dumps(data["payload"], sort_keys=True)
+    new_hash = calculate_hash(server_now, data["entry_type"], payload_str, prev_hash)
 
     new_event = Event(
         timestamp=server_now,
-        entry_type=data['entry_type'],
+        entry_type=data["entry_type"],
         payload=payload_str,
         prev_hash=prev_hash,
-        entry_hash=new_hash
+        entry_hash=new_hash,
     )
 
     db.session.add(new_event)
     db.session.commit()
 
-    return jsonify({
-        "status": "recorded",
-        "entry_id": new_event.id,
-        "entry_hash": new_hash,
-        "timestamp": server_now
-    }), 201
+    return jsonify(
+        {
+            "status": "recorded",
+            "entry_id": new_event.id,
+            "entry_hash": new_hash,
+            "timestamp": server_now,
+        }
+    ), 201
 
-# CRITICAL - this was missing, engine polls this endpoint every 2 minutes
-@app.route('/latest', methods=['GET'])
+
+@app.route("/latest", methods=["GET"])
 def get_latest():
     last_entry = Event.query.order_by(Event.id.desc()).first()
     if not last_entry:
         return jsonify({}), 200
     return jsonify(last_entry.to_dict()), 200
 
-@app.route('/entries', methods=['GET'])
-def get_entries():
-    page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 50, type=int)
-    events_query = Event.query.order_by(Event.id.asc()).paginate(page=page, per_page=per_page)
-    return jsonify({
-        "entries": [e.to_dict() for e in events_query.items],
-        "total": events_query.total,
-        "pages": events_query.pages,
-        "current_page": page
-    }), 200
 
-@app.route('/verify', methods=['GET'])
+@app.route("/entries", methods=["GET"])
+def get_entries():
+    page = request.args.get("page", 1, type=int)
+    per_page = request.args.get("per_page", 50, type=int)
+    events_query = Event.query.order_by(Event.id.asc()).paginate(page=page, per_page=per_page)
+    return jsonify(
+        {
+            "entries": [e.to_dict() for e in events_query.items],
+            "total": events_query.total,
+            "pages": events_query.pages,
+            "current_page": page,
+        }
+    ), 200
+
+
+@app.route("/verify", methods=["GET"])
 def verify_chain():
     all_events = Event.query.order_by(Event.id.asc()).all()
     is_valid = True
     expected_prev_hash = "0" * 64
 
-    for e in all_events:
-        actual_hash = calculate_hash(e.timestamp, e.entry_type, e.payload, e.prev_hash)
-        if actual_hash != e.entry_hash or e.prev_hash != expected_prev_hash:
+    for event in all_events:
+        actual_hash = calculate_hash(event.timestamp, event.entry_type, event.payload, event.prev_hash)
+        if actual_hash != event.entry_hash or event.prev_hash != expected_prev_hash:
             is_valid = False
             break
-        expected_prev_hash = e.entry_hash
+        expected_prev_hash = event.entry_hash
 
-    return jsonify({
-        "integrity_check": "passed" if is_valid else "failed",
-        "chain_length": len(all_events)
-    }), 200 if is_valid else 500
+    return jsonify(
+        {
+            "integrity_check": "passed" if is_valid else "failed",
+            "chain_length": len(all_events),
+        }
+    ), 200 if is_valid else 500
+
 
 with app.app_context():
     db.create_all()
+    print("Database tables ready.", flush=True)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host="0.0.0.0", port=port)
